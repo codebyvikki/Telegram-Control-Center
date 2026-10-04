@@ -111,11 +111,17 @@ async function disconnectTelegram(){
   b.disabled=true;
   b.textContent='Disconnecting...';
   try{
+    // The API returns immediately after invalidating the local session.
+    // Do not wait for Telegram's background logout/update cleanup here.
     await post('/api/disconnect');
     setStatus(false);
-    $('login').style.display='grid';
     $('app').style.display='none';
-    await poll();
+    $('login').style.display='grid';
+    b.disabled=false;
+    b.textContent=old;
+    loginBusy=false;
+    $('login-action').innerHTML='<div class="login-wait"><span class="spinner"></span><span>Preparing a new Telegram connection...</span></div>';
+    setTimeout(()=>login(),80);
   }catch(e){
     alert(e.message||'Unable to disconnect Telegram.');
     b.disabled=false;

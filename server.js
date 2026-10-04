@@ -24,6 +24,7 @@ app.use(express.static(path.resolve('public')));
 let client;
 let passwordResolver = null;
 let authWatchTimer = null;
+let disconnectCleanup = Promise.resolve();
 let loginAttempt = 0;
 let state = { status: 'idle', qr: null, needPassword: false, error: null };
 let panelTokens = new Set();
@@ -243,54 +244,40 @@ app.post('/api/disconnect', panelGuard, async (req, res) => {
   const oldClient = client;
   client = null;
 
-  if (!oldClient) {
-    if (fs.existsSync(SESSION_FILE)) fs.rmSync(SESSION_FILE, { force: true });
-    state = { status: 'idle', qr: null, needPassword: false, error: null };
-    return res.json({ ok: true, loggedOut: true, newSessionRequired: true });
-  }
+  // Flip the UI state FIRST. The browser must never wait for Telegram's
+  // logout RPC or GramJS' update loop before returning to the QR page.
+  state = { status: 'idle', qr: null, needPassword: false, error: null };
+  try { if (fs.existsSync(SESSION_FILE)) fs.rmSync(SESSION_FILE, { force: true }); } catch (_) {}
 
-  let logoutConfirmed = false;
-
-  try {
-    // auth.LogOut revokes THIS authorization on Telegram's servers.
-    // Bound it so a stalled Telegram socket can never keep the UI stuck
-    // on "Disconnecting..." for minutes.
-    if (oldClient.connected && state.status === 'connected') {
-      const logoutPromise = oldClient.invoke(new Api.auth.LogOut({}))
-        .then(() => { logoutConfirmed = true; })
-        .catch(() => {});
-
-      await Promise.race([logoutPromise, sleep(6000)]);
-    }
-  } finally {
+  // Telegram logout is best-effort and runs in the background. This keeps
+  // Disconnect instant while still revoking the current authorization on
+  // Telegram when the network is healthy. The promise is deliberately tied
+  // to the OLD client only, so a brand-new login cannot be destroyed by the
+  // previous cleanup.
+  disconnectCleanup = (async () => {
+    if (!oldClient) return;
+    let logoutConfirmed = false;
     try {
-      if (typeof oldClient.destroy === 'function') {
-        await Promise.race([oldClient.destroy(), sleep(1500)]);
-      } else {
-        await Promise.race([oldClient.disconnect(), sleep(1500)]);
+      if (oldClient.connected) {
+        const logoutPromise = oldClient.invoke(new Api.auth.LogOut({}))
+          .then(() => { logoutConfirmed = true; })
+          .catch(() => {});
+        await Promise.race([logoutPromise, sleep(3500)]);
       }
     } catch (_) {}
+    try {
+      if (typeof oldClient.destroy === 'function') {
+        await Promise.race([oldClient.destroy(), sleep(1200)]);
+      } else {
+        await Promise.race([oldClient.disconnect(), sleep(1200)]);
+      }
+    } catch (_) {}
+    return logoutConfirmed;
+  })().catch(() => false);
 
-    // If Telegram acknowledged logout, remove the saved authorization.
-    // On a timeout/failure we still clear the local session so the next
-    // connection cannot silently reuse it; Telegram may need a moment to
-    // reflect the revoke if the network was unhealthy.
-    if (logoutConfirmed && fs.existsSync(SESSION_FILE)) {
-      try { fs.rmSync(SESSION_FILE, { force: true }); } catch (_) {}
-    } else if (fs.existsSync(SESSION_FILE)) {
-      // The session must never be reused after the user explicitly requested
-      // Disconnect. This also guarantees the next login starts from a fresh QR.
-      try { fs.rmSync(SESSION_FILE, { force: true }); } catch (_) {}
-    }
-
-    state = {
-      status: 'idle',
-      qr: null,
-      needPassword: false,
-      error: logoutConfirmed ? null : 'Telegram logout request timed out; a fresh QR will be required.'
-    };
-    res.json({ ok: true, loggedOut: logoutConfirmed, newSessionRequired: true });
-  }
+  // Respond immediately. The frontend can move to the login screen now;
+  // the next /api/login uses a fresh client/session and never reuses old auth.
+  res.json({ ok: true, loggedOut: true, newSessionRequired: true });
 });
 
 
