@@ -1,0 +1,14 @@
+Telegram Control Center — Folder Sync Fix
+
+This build fixes Telegram chat-folder synchronization.
+
+Important:
+- Telegram custom folders are DialogFilter objects. They are NOT the archive
+  folder_id accepted by messages.getDialogs().
+- Folder membership is evaluated from Telegram's actual DialogFilter rules:
+  contacts, nonContacts, groups, broadcasts, bots, includePeers,
+  pinnedPeers, excludePeers, excludeArchived and excludeRead.
+- GramJS marked peer IDs are handled correctly:
+  user -> ID, group -> -ID, channel -> -100ID.
+- Existing .env/session/runtime data are intentionally excluded from this ZIP.
+  Keep your local .env and session files from your working installation.

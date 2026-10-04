@@ -23,6 +23,8 @@ app.use(express.static(path.resolve('public')));
 
 let client;
 let passwordResolver = null;
+let authWatchTimer = null;
+let loginAttempt = 0;
 let state = { status: 'idle', qr: null, needPassword: false, error: null };
 let panelTokens = new Set();
 let loginAttempts = new Map();
@@ -103,10 +105,42 @@ app.post('/api/panel/logout', (req, res) => { const token = req.headers['x-panel
 
 /* ---------------- LOGIN ---------------- */
 function createClient(sessionString = '') {
-  return new TelegramClient(new StringSession(sessionString), apiId, apiHash, { connectionRetries: 5 });
+  return new TelegramClient(new StringSession(sessionString), apiId, apiHash, { connectionRetries: 2 });
+}
+
+
+function stopAuthWatcher() {
+  if (authWatchTimer) {
+    clearInterval(authWatchTimer);
+    authWatchTimer = null;
+  }
+}
+
+function startAuthWatcher(attempt) {
+  stopAuthWatcher();
+  const check = async () => {
+    if (attempt !== loginAttempt || !client || state.status === 'connected') return;
+    try {
+      if (!client.connected) return;
+      if (await client.checkAuthorization()) {
+        if (attempt !== loginAttempt) return;
+        stopAuthWatcher();
+        fs.writeFileSync(SESSION_FILE, client.session.save(), { mode: 0o600 });
+        state = { status: 'connected', qr: null, needPassword: false, error: null };
+        passwordResolver = null;
+        await resumePersistedLoops();
+      }
+    } catch (_) {
+      // The QR/sign-in flow owns the connection lifecycle. A transient
+      // checkAuthorization failure must not abort the login flow.
+    }
+  };
+  check();
+  authWatchTimer = setInterval(check, 800);
 }
 
 async function init() {
+  stopAuthWatcher();
   if (!apiId || !apiHash) throw new Error('API_ID and API_HASH are required in .env');
   const saved = fs.existsSync(SESSION_FILE) ? fs.readFileSync(SESSION_FILE, 'utf8').trim() : '';
   client = createClient(saved);
@@ -118,10 +152,11 @@ async function init() {
 }
 
 app.post('/api/login', panelGuard, async (req, res) => {
-  if (state.status === 'connected' || state.status === 'waiting') return res.json({ ok: true });
+  if (state.status === 'connected') return res.json({ ok: true });
+  if (state.status === 'waiting') return res.json({ ok: true });
 
-  // Return immediately so the browser never appears stuck while GramJS
-  // reconnects to Telegram or starts the QR authentication flow.
+  const attempt = ++loginAttempt;
+  stopAuthWatcher();
   state = { status: 'waiting', qr: null, needPassword: false, error: null };
   res.json({ ok: true });
 
@@ -131,31 +166,63 @@ app.post('/api/login', panelGuard, async (req, res) => {
       if (!client.connected) await client.connect();
 
       if (await client.checkAuthorization()) {
+        if (attempt !== loginAttempt) return;
         state = { status: 'connected', qr: null, needPassword: false, error: null };
-        resumePersistedLoops();
+        await resumePersistedLoops();
         return;
       }
 
-      await client.signInUserWithQrCode({ apiId, apiHash }, {
+      const signInPromise = client.signInUserWithQrCode({ apiId, apiHash }, {
         qrCode: async (code) => {
+          if (attempt !== loginAttempt) return;
           const url = 'tg://login?token=' + code.token.toString('base64url');
           state.qr = await QRCode.toDataURL(url, { width: 320, margin: 2 });
+
+          // Do not wait for signInUserWithQrCode() to resolve before
+          // detecting authorization. Telegram may authorize the device first
+          // while the GramJS promise is still waiting on the next QR cycle.
+          startAuthWatcher(attempt);
         },
         password: async () => {
+          if (attempt !== loginAttempt) throw new Error('Login cancelled.');
+          stopAuthWatcher();
           state.needPassword = true;
           return new Promise((resolve) => { passwordResolver = resolve; });
         },
-        onError: async (e) => { state.error = e.message; return true; },
+        onError: async (e) => {
+          if (attempt === loginAttempt) state.error = e.message;
+          return true;
+        },
       });
 
+      // Also start the watcher here in case Telegram authorizes before the
+      // first QR callback finishes.
+      startAuthWatcher(attempt);
+
+      try {
+        await signInPromise;
+      } catch (e) {
+        // If the independent watcher already confirmed authorization, this
+        // promise is no longer relevant to the UI.
+        if (attempt !== loginAttempt || state.status === 'connected') return;
+        throw e;
+      }
+
+      if (attempt !== loginAttempt || state.status === 'connected') return;
+
+      stopAuthWatcher();
       fs.writeFileSync(SESSION_FILE, client.session.save(), { mode: 0o600 });
       state = { status: 'connected', qr: null, needPassword: false, error: null };
-      resumePersistedLoops();
+      passwordResolver = null;
+      await resumePersistedLoops();
     } catch (e) {
+      if (attempt !== loginAttempt || state.status === 'connected') return;
+      stopAuthWatcher();
       state = { status: 'idle', qr: null, needPassword: false, error: e.message };
     }
   })();
 });
+
 app.post('/api/password', panelGuard, (req, res) => {
   if (!passwordResolver) return res.status(409).json({ error: 'No Telegram 2FA request is pending.' });
   const p = String(req.body?.password || '');
@@ -165,38 +232,64 @@ app.post('/api/password', panelGuard, (req, res) => {
 app.get('/api/status', panelGuard, (req, res) => res.json(publicState()));
 
 app.post('/api/disconnect', panelGuard, async (req, res) => {
-  let loggedOut = false;
-  try {
-    // Stop active automation loops first so nothing can use the account during logout.
-    for (const l of loops.values()) stopLoop(l);
-    dialogMap = new Map();
-    folderMap = new Map();
-    passwordResolver = null;
+  loginAttempt++;
+  stopAuthWatcher();
 
-    if (client) {
-      if (state.status === 'connected') {
-        // IMPORTANT: disconnect() only closes the network connection. It does NOT
-        // remove this Telegram authorization from Settings -> Devices.
-        // auth.LogOut() revokes THIS session on Telegram's servers.
-        await client.invoke(new Api.auth.LogOut({}));
-        loggedOut = true;
-      }
-      try { await client.disconnect(); } catch (_) {}
-    }
+  for (const l of loops.values()) stopLoop(l);
+  dialogMap = new Map();
+  folderMap = new Map();
+  passwordResolver = null;
 
-    if (loggedOut && fs.existsSync(SESSION_FILE)) {
-      fs.rmSync(SESSION_FILE, { force: true });
-    }
+  const oldClient = client;
+  client = null;
 
-    // Do not reuse the old authorized client/session on the next Connect.
-    client = null;
+  if (!oldClient) {
+    if (fs.existsSync(SESSION_FILE)) fs.rmSync(SESSION_FILE, { force: true });
     state = { status: 'idle', qr: null, needPassword: false, error: null };
-    res.json({ ok: true, loggedOut: true, newSessionRequired: true });
-  } catch (e) {
-    // Never delete the saved session if Telegram did not confirm logout.
-    try { if (client && !client.connected) await client.connect(); } catch (_) {}
-    state.error = e.message;
-    res.status(500).json({ error: 'Telegram session could not be terminated. The saved session was kept safe.' });
+    return res.json({ ok: true, loggedOut: true, newSessionRequired: true });
+  }
+
+  let logoutConfirmed = false;
+
+  try {
+    // auth.LogOut revokes THIS authorization on Telegram's servers.
+    // Bound it so a stalled Telegram socket can never keep the UI stuck
+    // on "Disconnecting..." for minutes.
+    if (oldClient.connected && state.status === 'connected') {
+      const logoutPromise = oldClient.invoke(new Api.auth.LogOut({}))
+        .then(() => { logoutConfirmed = true; })
+        .catch(() => {});
+
+      await Promise.race([logoutPromise, sleep(6000)]);
+    }
+  } finally {
+    try {
+      if (typeof oldClient.destroy === 'function') {
+        await Promise.race([oldClient.destroy(), sleep(1500)]);
+      } else {
+        await Promise.race([oldClient.disconnect(), sleep(1500)]);
+      }
+    } catch (_) {}
+
+    // If Telegram acknowledged logout, remove the saved authorization.
+    // On a timeout/failure we still clear the local session so the next
+    // connection cannot silently reuse it; Telegram may need a moment to
+    // reflect the revoke if the network was unhealthy.
+    if (logoutConfirmed && fs.existsSync(SESSION_FILE)) {
+      try { fs.rmSync(SESSION_FILE, { force: true }); } catch (_) {}
+    } else if (fs.existsSync(SESSION_FILE)) {
+      // The session must never be reused after the user explicitly requested
+      // Disconnect. This also guarantees the next login starts from a fresh QR.
+      try { fs.rmSync(SESSION_FILE, { force: true }); } catch (_) {}
+    }
+
+    state = {
+      status: 'idle',
+      qr: null,
+      needPassword: false,
+      error: logoutConfirmed ? null : 'Telegram logout request timed out; a fresh QR will be required.'
+    };
+    res.json({ ok: true, loggedOut: logoutConfirmed, newSessionRequired: true });
   }
 });
 
@@ -212,7 +305,15 @@ async function loadDialogs() {
     let canSend = true;
     if (type === 'channel' && !e.creator && !e.adminRights) canSend = false;
     if (type === 'group' && e.defaultBannedRights?.sendMessages && !e.creator && !e.adminRights) canSend = false;
-    map.set(id, { id, title: d.title || d.name || 'Unknown', type, unread: d.unreadCount || 0, canSend, entity: e });
+    map.set(id, {
+      id,
+      title: d.title || d.name || 'Unknown',
+      type,
+      unread: d.unreadCount || 0,
+      archived: !!d.archived,
+      canSend,
+      entity: e
+    });
   }
   dialogMap = map;
   return map;
@@ -220,9 +321,15 @@ async function loadDialogs() {
 
 function peerToDialogId(peer) {
   if (!peer) return null;
+  // GramJS uses marked peer IDs:
+  //   user    -> 123
+  //   group   -> -123
+  //   channel -> -100123
+  // Do not use the archive folder_id here; dialog-filter peers are
+  // represented by InputPeer* objects.
   if (peer.userId != null) return String(peer.userId);
   if (peer.chatId != null) return String(-Number(peer.chatId));
-  if (peer.channelId != null) return String(-1000000000000 - Number(peer.channelId));
+  if (peer.channelId != null) return '-100' + String(peer.channelId);
   return null;
 }
 
@@ -241,12 +348,12 @@ function folderMatchesChat(filter, chat) {
   const isContact = !!e.contact;
 
   let included = false;
-  const hasCategory = !!(filter.includeContacts || filter.includeNonContacts || filter.includeGroups || filter.includeBroadcasts || filter.includeBots);
-  if (filter.includeContacts && isUser && isContact) included = true;
-  if (filter.includeNonContacts && isUser && !isContact) included = true;
-  if (filter.includeGroups && isGroup) included = true;
-  if (filter.includeBroadcasts && isBroadcast) included = true;
-  if (filter.includeBots && isBot) included = true;
+  const hasCategory = !!(filter.contacts || filter.nonContacts || filter.groups || filter.broadcasts || filter.bots);
+  if (filter.contacts && isUser && isContact) included = true;
+  if (filter.nonContacts && isUser && !isContact) included = true;
+  if (filter.groups && isGroup) included = true;
+  if (filter.broadcasts && isBroadcast) included = true;
+  if (filter.bots && isBot) included = true;
   if (!hasCategory) included = true;
 
   const includedPeers = [...(filter.includePeers || []), ...(filter.pinnedPeers || [])]
@@ -265,21 +372,97 @@ async function loadFolders() {
   const result = await client.invoke(new Api.messages.GetDialogFilters());
   const filters = Array.isArray(result?.filters) ? result.filters : [];
   const map = new Map();
+
+  // IMPORTANT:
+  // Telegram "chat folders" are DialogFilter objects, not the archive
+  // folder_id accepted by messages.getDialogs(). The latter is why the
+  // previous implementation returned empty folders on real accounts.
+  //
+  // Telegram exposes the exact folder rules as:
+  //   contacts / nonContacts / groups / broadcasts / bots
+  //   includePeers / pinnedPeers
+  //   excludePeers
+  //   excludeArchived / excludeRead
+  //
+  // We evaluate those rules against the same dialog cache that powers the
+  // normal All/Groups/Channels/Private lists. This keeps folder membership
+  // faithful to the user's actual Telegram configuration.
+
+  const chats = [...dialogMap.values()];
+
   for (const filter of filters) {
-    if (!filter || filter.id == null) continue;
-    // The default folder is not a user-created chat folder, so don't expose it as a custom folder.
-    const isDefault = filter.className === 'DialogFilterDefault';
-    if (isDefault) continue;
+    if (!filter || filter.id == null || filter.className === 'DialogFilterDefault') continue;
+
     const id = String(filter.id);
-    const members = [...dialogMap.values()].filter(chat => folderMatchesChat(filter, chat));
+    const includedPeerIds = new Set(
+      [...(filter.includePeers || []), ...(filter.pinnedPeers || [])]
+        .map(peerToDialogId)
+        .filter(Boolean)
+    );
+    const excludedPeerIds = new Set(
+      (filter.excludePeers || []).map(peerToDialogId).filter(Boolean)
+    );
+
+    const hasCategoryRule = !!(
+      filter.contacts ||
+      filter.nonContacts ||
+      filter.groups ||
+      filter.broadcasts ||
+      filter.bots
+    );
+
+    const members = chats.filter(chat => {
+      const e = chat.entity || {};
+      const isUser = chat.type === 'user';
+      const isGroup = chat.type === 'group';
+      const isChannel = chat.type === 'channel';
+      const isBroadcast = isChannel && !e.megagroup;
+      const isBot = isUser && !!e.bot;
+      const isContact = isUser && !!e.contact;
+
+      // A DialogFilter with no category flags starts empty and is populated
+      // by its explicit includePeers/pinnedPeers.
+      let included = false;
+
+      if (filter.contacts && isContact) included = true;
+      if (filter.nonContacts && isUser && !isContact) included = true;
+      if (filter.groups && isGroup) included = true;
+      if (filter.broadcasts && isBroadcast) included = true;
+      if (filter.bots && isBot) included = true;
+
+      // Explicitly included/pinned peers are part of the folder regardless
+      // of whether a category rule is also present.
+      if (includedPeerIds.has(chat.id)) included = true;
+
+      // Explicit exclusions always win.
+      if (excludedPeerIds.has(chat.id)) included = false;
+
+      // Folder rules can exclude archived/read dialogs. GramJS exposes
+      // archived state on Dialog; unread is already cached in this app.
+      if (filter.excludeArchived && chat.archived) included = false;
+      if (filter.excludeRead && !chat.unread) included = false;
+
+      // excludeMuted requires notification settings per peer. We deliberately
+      // do not guess here; all actual membership-defining rules above remain
+      // exact, while avoiding hundreds of extra API calls during every sync.
+      // Telegram's other folder criteria and explicit peer lists are handled
+      // server-side in the official clients and locally here from the filter.
+
+      return included;
+    });
+
     map.set(id, {
       id,
       title: folderTitle(filter),
       count: members.length,
-      groups: members.filter(c => c.type === 'group' || (c.type === 'channel' && c.canSend)).length,
-      chats: members.map(({ id, title, type, unread, canSend }) => ({ id, title, type, unread, canSend }))
+      groups: members.filter(c => c.type === 'group').length,
+      channels: members.filter(c => c.type === 'channel').length,
+      chats: members.map(({ id, title, type, unread, canSend }) => ({
+        id, title, type, unread, canSend
+      }))
     });
   }
+
   folderMap = map;
   return map;
 }

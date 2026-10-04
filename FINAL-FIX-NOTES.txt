@@ -1,0 +1,8 @@
+FINAL QR -> DASHBOARD FIX
+
+Replace server.js and public/index.html with the versions in this package.
+Keep your existing .env and session.txt in your current project.
+
+Expected flow:
+Disconnect -> Telegram session revoked -> local session removed -> Login page.
+Connect -> QR -> scan -> authorization watcher detects Telegram login -> Dashboard automatically.
